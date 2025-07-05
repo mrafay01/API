@@ -4,9 +4,17 @@ import os
 from flask import Flask, current_app, jsonify, request, abort
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import text
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from flask_cors import CORS
+from sqlalchemy.exc import SQLAlchemyError
+import traceback
+import random
+import string
 
+# If you installed via pip
+# from agora_token_builder import RtcTokenBuilder
+# If you copied the file
+from agora_token_builder import RtcTokenBuilder
 
 app = Flask("QuranAPI")
 
@@ -22,6 +30,8 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app, engine_options={"isolation_level": "AUTOCOMMIT"})
 
+AGORA_APP_ID = "your-app-id"
+AGORA_APP_CERTIFICATE = "your-app-certificate"
 
 @app.route("/GetStudent", methods=["GET"])
 def appuser():
@@ -80,8 +90,23 @@ def get_teachers():
         "bio",
         "languages",
     ]
-    rw = [dict(zip(keys, row)) for row in rows]
-    return jsonify(rw), 200
+    teachers = [dict(zip(keys, row)) for row in rows]
+
+    # For each teacher, fetch canTeach and available
+    for teacher in teachers:
+        teacher_id = teacher["id"]
+        # canTeach: list of course names
+        courses = db.session.execute(text("""
+            SELECT c.name FROM TeacherCourse tc JOIN Course c ON tc.course_id = c.id WHERE tc.qari_id = :tid
+        """), {"tid": teacher_id}).fetchall()
+        teacher["canTeach"] = [c[0] for c in courses]
+        # available: list of {day, time, course} for unbooked slots
+        slots = db.session.execute(text("""
+            SELECT ts.day, s.time, c.name as course_name FROM TeacherSchedule ts JOIN Slot s ON ts.id = s.sch_id LEFT JOIN Course c ON s.Course_id = c.id WHERE ts.teacher_id = :tid AND s.booked = 0
+        """), {"tid": teacher_id}).fetchall()
+        teacher["available"] = [{"day": s[0], "time": s[1], "course": s[2]} for s in slots]
+
+    return jsonify(teachers), 200
 
 
 @app.route("/SignUpStudents", methods=["POST"])
@@ -96,23 +121,18 @@ def SignupStudent():
     gender = body.get("gender", "def")
     pic = body.get("pic")
     pic_path = None
-
+    languages = body.get("languages", [])  # list of strings
     print("RAW pic value:", pic)
-
     if pic and pic != "def" and len(pic) > 30:
         try:
             header, encoded = pic.split(",", 1) if "," in pic else ("", pic)
             img_bytes = base64.b64decode(encoded)
-
             img_dir = os.path.join(current_app.root_path, "static", "profile_images")
             os.makedirs(img_dir, exist_ok=True)
-
             filename = f"{username}_profile.png"
             file_path = os.path.join(img_dir, filename)
-
             with open(file_path, "wb") as f:
                 f.write(img_bytes)
-
             pic_path = f"/static/profile_images/{filename}"
             print(f"Image saved at: {pic_path}")
         except Exception as e:
@@ -120,10 +140,8 @@ def SignupStudent():
             return jsonify({"error": "Failed to save image", "details": str(e)}), 500
     else:
         print("No valid image provided.")
-
     check_query = text(f"SELECT COUNT(*) FROM Student WHERE username = :username")
     result = db.session.execute(check_query, {"username": username}).scalar()
-
     if result > 0:
         return (
             jsonify(
@@ -131,12 +149,10 @@ def SignupStudent():
             ),
             409,
         )
-
     else:
         query = text(
             "INSERT INTO Student (username, name, password, region, gender, dob, pic) VALUES (:username, :name, :password, :region, :gender, :dob, :pic)"
         )
-
         try:
             db.session.execute(
                 query,
@@ -150,6 +166,17 @@ def SignupStudent():
                     "pic": pic_path,
                 },
             )
+            db.session.commit()
+            # Insert languages for student
+            student_id = db.session.execute(
+                text("SELECT id FROM Student WHERE username = :username"),
+                {"username": username}
+            ).scalar()
+            for lang in languages:
+                db.session.execute(
+                    text("INSERT INTO StudentLanguages (S_id, Languages) VALUES (:student_id, :lang)"),
+                    {"student_id": student_id, "lang": lang}
+                )
             db.session.commit()
             return jsonify({"message": "Inserted Data"}), 201
         except Exception as e:
@@ -217,23 +244,34 @@ def SignUpParent():
         return jsonify({"error": "Student username does not exist"}), 404
 
     # 3. Insert into Parent table (no student_ID)
-    insert_query = text(
-        "INSERT INTO Parent (name, cnic, username, password, region, pic) "
-        "VALUES (:name, :cnic, :username, :password, :region, :pic)"
-    )
+    if pic_path:
+        insert_query = text(
+            "INSERT INTO Parent (name, cnic, username, password, region, pic) "
+            "VALUES (:name, :cnic, :username, :password, :region, :pic)"
+        )
+        params = {
+            "name": name,
+            "cnic": cnic,
+            "username": username,
+            "password": password,
+            "region": region,
+            "pic": pic_path,
+        }
+    else:
+        insert_query = text(
+            "INSERT INTO Parent (name, cnic, username, password, region) "
+            "VALUES (:name, :cnic, :username, :password, :region)"
+        )
+        params = {
+            "name": name,
+            "cnic": cnic,
+            "username": username,
+            "password": password,
+            "region": region,
+        }
 
     try:
-        db.session.execute(
-            insert_query,
-            {
-                "name": name,
-                "cnic": cnic,
-                "username": username,
-                "password": password,
-                "region": region,
-                "pic": pic_path,
-            },
-        )
+        db.session.execute(insert_query, params)
         db.session.commit()
     except Exception as err:
         print(err)
@@ -270,7 +308,7 @@ def SignupTeacher():
     dob = body.get("dob", "def")
     pic = body.get("pic")
     pic_path = None
-
+    languages = body.get("languages", [])  # list of strings
     # Handle image upload (same as before)
     if pic and len(pic) > 30:
         try:
@@ -285,13 +323,11 @@ def SignupTeacher():
             pic_path = f"/static/profile_images/{filename}"
         except Exception as e:
             return jsonify({"error": "Failed to save image", "details": str(e)}), 500
-
     # Check duplicate username
     check_query = text("SELECT COUNT(*) FROM Teacher WHERE username = :username")
     result = db.session.execute(check_query, {"username": username}).scalar()
     if result > 0:
         return jsonify({"error": "Username already taken"}), 409
-
     # Insert Teacher (only basic info, set hourly_rate, SampleClip, etc. to NULL/default)
     insert_query = text(
         """
@@ -315,11 +351,21 @@ def SignupTeacher():
             },
         )
         db.session.commit()
+        # Insert languages for teacher
+        teacher_id = db.session.execute(
+            text("SELECT id FROM Teacher WHERE username = :username"),
+            {"username": username}
+        ).scalar()
+        for lang in languages:
+            db.session.execute(
+                text("INSERT INTO Teacher_Languages (TeacherID, Languages) VALUES (:teacher_id, :lang)"),
+                {"teacher_id": teacher_id, "lang": lang}
+            )
+        db.session.commit()
     except Exception as e:
-        print("Teacher insertion failed:", e)  # <-- Add this line!
+        print("Teacher insertion failed:", e)
         db.session.rollback()
         return jsonify({"error": "Teacher insertion failed", "details": str(e)}), 501
-
     return jsonify({"message": "Teacher registered successfully"}), 201
 
 
@@ -330,7 +376,6 @@ def SignUpTeacherExtra():
     hourly_rate = body.get("hourly_rate")
     courses = body.get("courses", [])  # list of strings
     sample_clip = body.get("sample_clip", None)
-
     # Save the video sample (optional, you can store as file or in DB)
     sample_clip_path = None
     if sample_clip and len(sample_clip) > 30:
@@ -348,7 +393,6 @@ def SignUpTeacherExtra():
             sample_clip_path = f"/static/teacher_samples/{filename}"
         except Exception as e:
             return jsonify({"error": "Failed to save video", "details": str(e)}), 500
-
     # Update teacher's hourly_rate and sample_clip in DB
     try:
         db.session.execute(
@@ -368,21 +412,16 @@ def SignUpTeacherExtra():
             jsonify({"error": "Failed to update teacher profile", "details": str(e)}),
             500,
         )
-
     # Insert courses (if you have a Teacher_Courses table)
     teacher_id = db.session.execute(
         text("SELECT id FROM Teacher WHERE username = :username"),
         {"username": username},
     ).scalar()
-    
-
     for course in courses:
-        print(course)
         course_id = db.session.execute(
         text("SELECT id FROM Course WHERE name = :course"),
         {"course": course}
         ).scalar()
-
         if course_id:
             db.session.execute(
             text(
@@ -391,26 +430,37 @@ def SignUpTeacherExtra():
             {"teacher_id": teacher_id, "course_id": course_id},
         )
     db.session.commit()
-
     # Add schedule (days and slots)
     schedule = body.get("schedule", [])
     for entry in schedule:
         day = entry.get("day")
         slots = entry.get("slots", [])
-        # Insert into TeacherSchedule
-        result = db.session.execute(
-            text("INSERT INTO TeacherSchedule (day, teacher_id) OUTPUT inserted.id VALUES (:day, :teacher_id)"),
-            {"day": day, "teacher_id": teacher_id}
-        )
-        sch_id = result.scalar()
-        # Insert each slot for this day
+        course_name = entry.get("course")  # Course for slot is optional
+        course_id = None
+        if course_name:
+            course_id = db.session.execute(
+                text("SELECT id FROM Course WHERE name = :course"),
+                {"course": course_name}
+            ).scalar()
+        # If course_id is None, use a default (e.g., 1) or NULL if allowed by DB
         for slot_time in slots:
+            # Fetch or create TeacherSchedule for this teacher and day
+            sch = db.session.execute(
+                text("SELECT id FROM TeacherSchedule WHERE teacher_id = :tid AND day = :day"),
+                {"tid": teacher_id, "day": day}
+            ).fetchone()
+            if not sch:
+                sch_id = db.session.execute(
+                    text("INSERT INTO TeacherSchedule (day, teacher_id) OUTPUT inserted.id VALUES (:day, :tid)"),
+                    {"day": day, "tid": teacher_id}
+                ).scalar()
+            else:
+                sch_id = sch.id
             db.session.execute(
                 text("INSERT INTO Slot (time, sch_id, booked) VALUES (:time, :sch_id, 0)"),
                 {"time": slot_time, "sch_id": sch_id}
             )
     db.session.commit()
-
     return jsonify({"message": "Teacher profile completed"}), 201
 
 
@@ -1095,33 +1145,38 @@ def get_user_profile(role):
     return jsonify(dict(result))
 
 
-@app.route("/api/parent/children-progress", methods=["GET"])
-def get_children_progress():
-    username = request.args.get("username")
-    if not username:
-        return jsonify({"error": "Username is required"}), 400
-
-    # Get parent id from username
+def fetch_children_for_parent(username):
     parent = db.session.execute(
         text("SELECT id FROM Parent WHERE username = :username"),
         {"username": username}
     ).fetchone()
     if not parent:
-        return jsonify({"error": "Parent not found"}), 404
-
+        return None, "Parent not found"
     parent_id = parent.id
-
-    # Get all children for this parent
+    # Join Student and Enrollment to get enrolledDate for each child (earliest enrollment)
     children = db.session.execute(text("""
         SELECT 
             s.id,
             s.name,
             s.pic AS avatar,
             s.dob,
-            s.enrolledDate
+            MIN(e.start_date) AS enrolledDate  -- earliest enrollment date
         FROM Student s
+        LEFT JOIN Enrollment e ON e.student_id = s.id
         WHERE s.parent_id = :parent_id
+        GROUP BY s.id, s.name, s.pic, s.dob
     """), {"parent_id": parent_id}).fetchall()
+    return children, None
+
+@app.route("/api/parent/children-progress", methods=["GET"])
+def get_children_progress():
+    username = request.args.get("username")
+    if not username:
+        return jsonify({"error": "Username is required"}), 400
+
+    children, error = fetch_children_for_parent(username)
+    if error:
+        return jsonify({"error": error}), 404
 
     children_list = []
     for child in children:
@@ -1131,13 +1186,21 @@ def get_children_progress():
             today = datetime.today()
             age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
 
-        # Get overall progress (replace with your real logic)
-        overall_progress = db.session.execute(
-            text("SELECT COALESCE(AVG(progress), 0) FROM Progress WHERE student_id = :student_id"),
-            {"student_id": child.id}
-        ).scalar()
+        # Get overall progress using actual lesson progress
+        progress_query = text("""
+            SELECT 
+                COUNT(*) AS total_lessons,
+                SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) AS completed_lessons
+            FROM StudentLessonProgress 
+            WHERE student_id = :student_id
+        """)
+        progress_result = db.session.execute(progress_query, {"student_id": child.id}).fetchone()
+        
+        total_lessons = progress_result.total_lessons or 0
+        completed_lessons = progress_result.completed_lessons or 0
+        overall_progress = int((completed_lessons / total_lessons) * 100) if total_lessons > 0 else 0
 
-        # Get total hours (replace with your real logic)
+        # Get total hours from video call sessions
         total_hours = db.session.execute(
             text("SELECT COALESCE(SUM(DATEDIFF(MINUTE, CallStartTime, CallEndTime)), 0) / 60.0 FROM VideoCallSession WHERE StudentID = :student_id"),
             {"student_id": child.id}
@@ -1149,12 +1212,13 @@ def get_children_progress():
             "avatar": child.avatar or "",  
             "age": age,
             "enrolledDate": child.enrolledDate if hasattr(child, 'enrolledDate') else None,
-            "overallProgress": round(overall_progress or 0),
+            "overallProgress": overall_progress,
             "totalHours": round(total_hours or 0, 1),
+            "totalLessons": total_lessons,
+            "completedLessons": completed_lessons
         })
 
     return jsonify({"children": children_list})
-
 
 
 @app.route("/api/profile", methods=["GET"])
@@ -1658,12 +1722,12 @@ def GetTeachersByCourse():
 def avail_slots():
     qari_id = request.args.get("qari_id")
     query = text(
-        f"""SELECT t.id AS qariId, t.name AS qariName, ts.day, s.time, s.slot_id  FROM Teacher t 
+        f"""SELECT t.id AS qariId, t.name AS qariName, ts.day, s.time, s.slot_id, c.id as course_id, c.name as course_name FROM Teacher t 
                     INNER JOIN TeacherSchedule ts ON t.id = ts.teacher_id 
                     INNER JOIN Slot s ON ts.id = s.sch_id
-                    WHERE t.id = '{qari_id}' AND booked = 0"""
+                    LEFT JOIN Course c ON s.Course_id = c.id
+                    WHERE t.id = '{qari_id}' AND s.booked = 0"""
     )
-    print(query)
     try:
         res = db.session.execute(query)
         rw = []
@@ -1673,6 +1737,8 @@ def avail_slots():
             "day",
             "time",
             "slot_id",
+            "course_id",
+            "course_name"
         ]
         for row in res:
             rw.append(dict(zip(keys, row)))
@@ -1688,27 +1754,23 @@ def book_slots():
     student_id = body.get("student_id")
     course_id = body.get("course_id")
     slots = body.get("slots")  # [ 1, 2, 3, 4, 5] => 1,2,3,4,5
-
     try:
         bookedSlots = ",".join([str(x) for x in slots])
         res = db.session.execute(
             text(
-                f"INSERT INTO Enrollment OUTPUT inserted.id VALUES('{student_id}', '{qari_id}', '{course_id}')"
+                f"INSERT INTO Enrollment (student_id, qari_id, course_id) OUTPUT inserted.id VALUES('{student_id}', '{qari_id}', '{course_id}')"
             )
         )
         generated_id = res.scalar()
-        bookQuery = text(f"UPDATE Slot SET booked = 1 WHERE slot_id IN({bookedSlots})")
+        bookQuery = text(f"UPDATE Slot SET booked = 1, Course_id = {course_id} WHERE slot_id IN({bookedSlots})")
         db.session.execute(bookQuery)
-
         for i in slots:
             db.session.execute(
                 text(
                     f"INSERT INTO BookedEnrollmentSlots VALUES('{generated_id}', '{i}')"
                 )
             )
-
         return jsonify({"success": True})
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1811,44 +1873,34 @@ def UpdateTeacherByUsername():
 @app.route("/GetQariCoursesAndSchedule", methods=["GET"])
 def GetQariCoursesAndSchedule():
     qari_id = request.args.get("qari_id")
-
     if not qari_id:
         return jsonify({"error": "Qari ID is required"}), 400
-
     query = text(
         """
-            SELECT t.id AS QariId,t.name AS QariName,c.id AS CourseId,c.name AS CourseName,c.description AS CourseDescription,ts.day AS ScheduleDay,s.time AS SlotTime,s.slot_id AS SlotId, s.booked AS IsBooked
+            SELECT t.id AS QariId, t.name AS QariName, ts.day AS ScheduleDay, s.time AS SlotTime, s.slot_id AS SlotId, s.booked AS IsBooked, c.id AS CourseId, c.name AS CourseName, c.description AS CourseDescription
             FROM Teacher t
-            INNER JOIN TeacherCourse tc 
-            ON t.id = tc.qari_id
-            INNER JOIN Course c 
-            ON tc.course_id = c.id
-            INNER JOIN TeacherSchedule ts 
-            ON t.id = ts.teacher_id
-            INNER JOIN Slot s 
-            ON ts.id = s.sch_id
+            INNER JOIN TeacherSchedule ts ON t.id = ts.teacher_id
+            INNER JOIN Slot s ON ts.id = s.sch_id
+            LEFT JOIN Course c ON s.Course_id = c.id
             WHERE t.id = :qari_id
-            """
+        """
     )
-
     try:
         result = db.session.execute(query, {"qari_id": qari_id})
         rw = []
         keys = [
             "QariId",
             "QariName",
-            "CourseId",
-            "CourseName",
-            "CourseDescription",
             "ScheduleDay",
             "SlotTime",
             "SlotId",
             "IsBooked",
+            "CourseId",
+            "CourseName",
+            "CourseDescription"
         ]
-
         for row in result:
             rw.append(dict(zip(keys, row)))
-
         if not rw:
             return (
                 jsonify(
@@ -1856,9 +1908,7 @@ def GetQariCoursesAndSchedule():
                 ),
                 404,
             )
-
         return jsonify(rw), 200
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -2235,9 +2285,10 @@ def hire_teacher(username):
                 if int(slot_id) not in valid_slot_ids:
                     db.session.rollback()
                     return jsonify({'error': f'Invalid or already booked slot ID: {slot_id}'}), 400
-            # Book slots
+            # Book slots and set Course_id
             db.session.execute(
-                text(f"UPDATE Slot SET booked = 1 WHERE slot_id IN ({','.join(str(int(sid)) for sid in selected_schedule)})")
+                text(f"UPDATE Slot SET booked = 1, Course_id = :course_id WHERE slot_id IN ({','.join(str(int(sid)) for sid in selected_schedule)})"),
+                {"course_id": course_id}
             )
             for slot_id in selected_schedule:
                 db.session.execute(
@@ -2245,7 +2296,12 @@ def hire_teacher(username):
                     {"enrollment_id": enrollment_id, "slot_id": int(slot_id)}
                 )
         db.session.commit()
-        return jsonify({'message': 'Teacher hired and student enrolled successfully!'}), 201
+        print("Returning success response for hire-teacher")
+        try:
+            return jsonify({'message': 'Teacher hired and student enrolled successfully!'}), 201
+        except Exception as e:
+            print("Error in return:", e)
+            return jsonify({'error': 'Response error', 'details': str(e)}), 500
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': 'Failed to hire teacher', 'details': str(e)}), 500
@@ -2285,9 +2341,13 @@ def GetTeacherCompleteData():
 
     # 4. Schedule with slots and booked status
     schedule_query = text("""
-        SELECT ts.id AS schedule_id, ts.day, s.slot_id, s.time, s.booked
+        SELECT ts.id AS schedule_id, ts.day, s.slot_id, s.time, s.booked, s.sch_id, s.Course_id, c.name as course_name,
+               st.username as student_username, st.name as student_name
         FROM TeacherSchedule ts
         LEFT JOIN Slot s ON ts.id = s.sch_id
+        LEFT JOIN Course c ON s.Course_id = c.id
+        LEFT JOIN Enrollment e ON e.qari_id = ts.teacher_id AND e.course_id = s.Course_id
+        LEFT JOIN Student st ON e.student_id = st.id
         WHERE ts.teacher_id = :id
         ORDER BY ts.day, s.time
     """)
@@ -2301,8 +2361,16 @@ def GetTeacherCompleteData():
             "day": row.day,
             "slotId": row.slot_id,
             "time": time_val,
-            "isBooked": bool(row.booked) if row.booked is not None else None
+            "isBooked": bool(row.booked) if row.booked is not None else None,
+            "course": {"courseId": row.Course_id, "courseName": row.course_name} if row.Course_id else None
         })
+        
+        # Add student information if the slot is booked
+        if row.booked and row.student_username:
+            schedule_list[-1]["student"] = {
+                "username": row.student_username,
+                "name": row.student_name
+            }
 
     teacher_data['schedule'] = schedule_list
 
@@ -2338,16 +2406,19 @@ def GetSchedule():
     role = request.args.get('role', '').lower()
     if not username or not role:
         return jsonify({'error': 'Username and role are required'}), 400
-
     if role == 'teacher':
         teacher = db.session.execute(text("SELECT id FROM Teacher WHERE username = :username"), {"username": username}).fetchone()
         if not teacher:
             return jsonify({'error': 'Teacher not found'}), 404
         teacher_id = teacher.id
         schedule_query = text("""
-            SELECT ts.id AS schedule_id, ts.day, s.slot_id, s.time, s.booked, s.sch_id
+            SELECT ts.id AS schedule_id, ts.day, s.slot_id, s.time, s.booked, s.sch_id, s.Course_id, c.name as course_name,
+                   st.username as student_username, st.name as student_name
             FROM TeacherSchedule ts
             LEFT JOIN Slot s ON ts.id = s.sch_id
+            LEFT JOIN Course c ON s.Course_id = c.id
+            LEFT JOIN Enrollment e ON e.qari_id = ts.teacher_id AND e.course_id = s.Course_id
+            LEFT JOIN Student st ON e.student_id = st.id
             WHERE ts.teacher_id = :id
             ORDER BY ts.day, s.time
         """)
@@ -2359,80 +2430,57 @@ def GetSchedule():
                 "day": row.day,
                 "slotId": row.slot_id,
                 "time": row.time,
-                "isBooked": bool(row.booked) if row.booked is not None else None
+                "isBooked": bool(row.booked) if row.booked is not None else None,
+                "course": {"courseId": row.Course_id, "courseName": row.course_name} if row.Course_id else None
             }
-            if row.slot_id and row.booked == 1:
-                # Find the related enrollment for this slot and teacher
-                enrollment = db.session.execute(text("""
-                    SELECT TOP 1 e.*, c.id AS course_id, c.name AS course_name, s.id AS student_id, s.name AS student_name, s.username AS student_username, t.id AS teacher_id, t.name AS teacher_name, t.username AS teacher_username
-                    FROM Enrollment e
-                    JOIN Course c ON e.course_id = c.id
-                    JOIN Student s ON e.student_id = s.id
-                    JOIN Teacher t ON e.qari_id = t.id
-                    WHERE e.qari_id = :teacher_id
-                        AND e.qari_id = (SELECT teacher_id FROM TeacherSchedule WHERE id = :sch_id)
-                """), {"teacher_id": teacher_id, "sch_id": row.sch_id}).fetchone()
-                if enrollment:
-                    slot_info["course"] = {"courseId": enrollment.course_id, "courseName": enrollment.course_name}
-                    slot_info["student"] = {"studentId": enrollment.student_id, "studentName": enrollment.student_name, "studentUsername": enrollment.student_username}
-                    slot_info["teacher"] = {"teacherId": enrollment.teacher_id, "teacherName": enrollment.teacher_name, "teacherUsername": enrollment.teacher_username}
-                else:
-                    slot_info["course"] = None
-                    slot_info["student"] = None
-                    slot_info["teacher"] = None
-            else:
-                slot_info["course"] = None
-                slot_info["student"] = None
-                slot_info["teacher"] = None
+            
+            # Add student information if the slot is booked
+            if row.booked and row.student_username:
+                slot_info["student"] = {
+                    "username": row.student_username,
+                    "name": row.student_name
+                }
+            
             schedule_list.append(slot_info)
         return jsonify({'role': 'Teacher', 'schedule': schedule_list}), 200
-
     elif role == 'student':
         student = db.session.execute(text("SELECT id FROM Student WHERE username = :username"), {"username": username}).fetchone()
         if not student:
             return jsonify({'error': 'Student not found'}), 404
         student_id = student.id
-        # Get all slots for this student by Slot table
         slots_query = text("""
-            SELECT s.slot_id, s.time, ts.day, s.booked, s.sch_id
+            SELECT s.slot_id, s.time, ts.day, s.booked, s.sch_id, s.Course_id, c.name as course_name, 
+                   t.username as teacher_username, t.name as teacher_name
             FROM Slot s
             JOIN TeacherSchedule ts ON s.sch_id = ts.id
+            LEFT JOIN Course c ON s.Course_id = c.id
+            JOIN Teacher t ON ts.teacher_id = t.id
             ORDER BY ts.day, s.time
         """)
         slots = db.session.execute(slots_query).fetchall()
         slot_list = []
         for slot in slots:
+            # Check if this slot has been swapped/transferred
+            swap_info = check_slot_swap_info(slot.slot_id)
+            
             slot_info = {
                 "slotId": slot.slot_id,
                 "day": slot.day,
                 "time": slot.time,
-                "isBooked": bool(slot.booked)
+                "isBooked": bool(slot.booked),
+                "course": {"courseId": slot.Course_id, "courseName": slot.course_name} if slot.Course_id else None,
+                "teacher": {
+                    "username": slot.teacher_username,
+                    "name": slot.teacher_name
+                }
             }
-            if slot.booked == 1:
-                enrollment = db.session.execute(text("""
-                    SELECT TOP 1 e.*, c.id AS course_id, c.name AS course_name, s2.id AS student_id, s2.name AS student_name, s2.username AS student_username, t.id AS teacher_id, t.name AS teacher_name, t.username AS teacher_username
-                    FROM Enrollment e
-                    JOIN Course c ON e.course_id = c.id
-                    JOIN Student s2 ON e.student_id = s2.id
-                    JOIN Teacher t ON e.qari_id = t.id
-                    WHERE e.student_id = :student_id
-                        AND e.qari_id = (SELECT teacher_id FROM TeacherSchedule WHERE id = :sch_id)
-                """), {"student_id": student_id, "sch_id": slot.sch_id}).fetchone()
-                if enrollment:
-                    slot_info["course"] = {"courseId": enrollment.course_id, "courseName": enrollment.course_name}
-                    slot_info["student"] = {"studentId": enrollment.student_id, "studentName": enrollment.student_name, "studentUsername": enrollment.student_username}
-                    slot_info["teacher"] = {"teacherId": enrollment.teacher_id, "teacherName": enrollment.teacher_name, "teacherUsername": enrollment.teacher_username}
-                else:
-                    slot_info["course"] = None
-                    slot_info["student"] = None
-                    slot_info["teacher"] = None
-            else:
-                slot_info["course"] = None
-                slot_info["student"] = None
-                slot_info["teacher"] = None
+            
+            # Add swap information if the slot was transferred
+            if swap_info:
+                slot_info["swapInfo"] = swap_info
+            
             slot_list.append(slot_info)
         return jsonify({'role': 'Student', 'schedule': slot_list}), 200
-
     elif role == 'parent':
         parent = db.session.execute(text("SELECT id FROM Parent WHERE username = :username"), {"username": username}).fetchone()
         if not parent:
@@ -2441,30 +2489,45 @@ def GetSchedule():
         children = db.session.execute(text("SELECT id, name FROM Student WHERE parent_id = :parent_id"), {"parent_id": parent_id}).fetchall()
         children_schedules = []
         for child in children:
-            # Just fetch all slots for this child (no joins to other tables)
             slots_query = text("""
-                SELECT s.slot_id, s.time, ts.day, s.booked
+                SELECT s.slot_id, s.time, ts.day, s.booked, s.Course_id, c.name as course_name,
+                       t.username as teacher_username, t.name as teacher_name,
+                       st.username as student_username, st.name as student_name
                 FROM Slot s
                 JOIN TeacherSchedule ts ON s.sch_id = ts.id
+                LEFT JOIN Course c ON s.Course_id = c.id
+                JOIN Teacher t ON ts.teacher_id = t.id
+                LEFT JOIN Enrollment e ON e.qari_id = t.id AND e.course_id = s.Course_id
+                LEFT JOIN Student st ON e.student_id = st.id
+                WHERE s.booked = 1
                 ORDER BY ts.day, s.time
             """)
             slots = db.session.execute(slots_query).fetchall()
-            slot_list = [
-                {
+            slot_list = []
+            for slot in slots:
+                slot_info = {
                     "slotId": slot.slot_id,
                     "day": slot.day,
                     "time": slot.time,
-                    "isBooked": bool(slot.booked)
+                    "isBooked": bool(slot.booked),
+                    "course": {"courseId": slot.Course_id, "courseName": slot.course_name} if slot.Course_id else None,
+                    "teacher": {
+                        "username": slot.teacher_username,
+                        "name": slot.teacher_name
+                    }
                 }
-                for slot in slots
-            ]
+                if slot.booked and slot.student_username:
+                    slot_info["student"] = {
+                        "username": slot.student_username,
+                        "name": slot.student_name
+                    }
+                slot_list.append(slot_info)
             children_schedules.append({
                 'childId': child.id,
                 'childName': child.name,
                 'slots': slot_list
             })
         return jsonify({'role': 'Parent', 'childrenSchedules': children_schedules}), 200
-
     else:
         return jsonify({'error': 'Invalid role'}), 400
 
@@ -2505,7 +2568,7 @@ def GetStudentProgress():
         progress = int((completed / total) * 100) if total > 0 else 0
 
         # Get total lessons for the course (regardless of student progress)
-        total_course_lessons_query = text("SELECT COUNT(*) FROM Lesson WHERE course_id = :course_id")
+        total_course_lessons_query = text("SELECT COUNT(*) FROM QuranLessons WHERE CourseID = :course_id")
         total_course_lessons = db.session.execute(total_course_lessons_query, {"course_id": enroll.course_id}).scalar() or 0
 
         progress_data.append({
@@ -2535,10 +2598,11 @@ def GetCourseLessons():
 
     # Get all lessons for the course
     lessons_query = text("""
-        SELECT l.id AS id, l.name
-        FROM Lesson l
-        WHERE l.course_id = :course_id
-        ORDER BY l.id
+        SELECT ql.ID AS id, CONCAT(s.SurahName, ' (Ruku ', ql.RukuID, ')') AS name
+        FROM QuranLessons ql
+        JOIN Surah s ON ql.SurahNo = s.SurahNo
+        WHERE ql.CourseID = :course_id
+        ORDER BY ql.ID
     """)
     lessons = db.session.execute(lessons_query, {"course_id": course_id}).fetchall()
 
@@ -2662,5 +2726,630 @@ def GetTeacherStudents():
         })
     return jsonify({"courses": result}), 200
 
+
+# --- Slot Incharge/Swap Request Endpoints ---
+
+@app.route('/RequestIncharge', methods=['POST'])
+def request_incharge():
+    body = request.json
+    from_teacher_username = body.get('fromTeacher')
+    to_teacher_username = body.get('toTeacher')
+    slot_ids = body.get('slotIds', [])
+    note = body.get('note', '')
+    if not from_teacher_username or not to_teacher_username or not slot_ids:
+        return jsonify({'error': 'Missing required fields'}), 400
+    # Get teacher IDs
+    from_teacher = db.session.execute(text("SELECT id FROM Teacher WHERE username = :u"), {'u': from_teacher_username}).fetchone()
+    to_teacher = db.session.execute(text("SELECT id FROM Teacher WHERE username = :u"), {'u': to_teacher_username}).fetchone()
+    if not from_teacher or not to_teacher:
+        return jsonify({'error': 'Invalid teacher username(s)'}), 400
+    from_teacher_id = from_teacher.id
+    to_teacher_id = to_teacher.id
+    slot_ids_str = ','.join(str(sid) for sid in slot_ids)
+    try:
+        db.session.execute(text("""
+            INSERT INTO SlotInchargeRequest (from_teacher_id, to_teacher_id, slot_ids, status, created_at)
+            VALUES (:from_teacher_id, :to_teacher_id, :slot_ids, 'pending', GETDATE())
+        """), {
+            'from_teacher_id': from_teacher_id,
+            'to_teacher_id': to_teacher_id,
+            'slot_ids': slot_ids_str
+        })
+        db.session.commit()
+        return jsonify({'message': 'Request sent successfully'}), 201
+    except SQLAlchemyError as e:
+        db.session.rollback()
+        return jsonify({'error': 'Failed to send request', 'details': str(e)}), 500
+
+@app.route('/GetInchargeRequests', methods=['GET'])
+def get_incharge_requests():
+    username = request.args.get('username')
+    if not username:
+        return jsonify({'error': 'Username is required'}), 400
+    teacher = db.session.execute(text("SELECT id FROM Teacher WHERE username = :u"), {'u': username}).fetchone()
+    if not teacher:
+        return jsonify({'error': 'Teacher not found'}), 404
+    teacher_id = teacher.id
+    # Get incoming requests
+    requests = db.session.execute(text("""
+        SELECT r.id, t1.username AS from_teacher, t2.username AS to_teacher, r.slot_ids, r.status, r.created_at, r.responded_at, r.from_teacher_id
+        FROM SlotInchargeRequest r
+        JOIN Teacher t1 ON r.from_teacher_id = t1.id
+        JOIN Teacher t2 ON r.to_teacher_id = t2.id
+        WHERE r.to_teacher_id = :tid
+        ORDER BY r.created_at DESC
+    """), {'tid': teacher_id}).fetchall()
+    result = []
+    for row in requests:
+        slot_ids = [int(sid) for sid in row.slot_ids.split(',') if sid]
+        slot_details = []
+        for slot_id in slot_ids:
+            slot_row = db.session.execute(text("""
+                SELECT s.slot_id, ts.day, s.time, s.booked, s.Course_id, c.name as course_name
+                FROM Slot s
+                JOIN TeacherSchedule ts ON s.sch_id = ts.id
+                LEFT JOIN Course c ON s.Course_id = c.id
+                WHERE s.slot_id = :slot_id
+            """), {'slot_id': slot_id}).fetchone()
+            if slot_row:
+                slot_details.append({
+                    'slotId': slot_row.slot_id,
+                    'day': slot_row.day,
+                    'time': slot_row.time,
+                    'isBooked': bool(slot_row.booked),
+                    'course': {"courseId": slot_row.Course_id, "courseName": slot_row.course_name} if slot_row.Course_id else None
+                })
+        result.append({
+            'requestId': row.id,
+            'fromTeacher': row.from_teacher,
+            'toTeacher': row.to_teacher,
+            'slots': slot_details,
+            'status': row.status,
+            'createdAt': str(row.created_at),
+            'respondedAt': str(row.responded_at) if row.responded_at else None
+        })
+    return jsonify({'requests': result}), 200
+
+@app.route('/RespondInchargeRequest', methods=['POST'])
+def respond_incharge_request():
+    body = request.json
+    request_id = body.get('requestId')
+    response = body.get('response')  # 'accept' or 'decline'
+    if not request_id or response not in ('accept', 'decline'):
+        return jsonify({'error': 'Missing or invalid fields'}), 400
+    # Get the request
+    req = db.session.execute(text("SELECT * FROM SlotInchargeRequest WHERE id = :id"), {'id': request_id}).fetchone()
+    if not req:
+        return jsonify({'error': 'Request not found'}), 404
+    if req.status != 'pending':
+        return jsonify({'error': 'Request already responded'}), 400
+    try:
+        if response == 'accept':
+            # Transfer slot ownership: update Slot.sch_id to the new teacher's schedule
+            slot_ids = [int(sid) for sid in req.slot_ids.split(',') if sid]
+            # Find the to_teacher's schedule ids for each slot's day
+            for slot_id in slot_ids:
+                # Get slot info
+                slot = db.session.execute(text("SELECT sch_id FROM Slot WHERE slot_id = :sid"), {'sid': slot_id}).fetchone()
+                if not slot:
+                    continue
+                # Get the day for this slot's schedule
+                sch = db.session.execute(text("SELECT day FROM TeacherSchedule WHERE id = :sch_id"), {'sch_id': slot.sch_id}).fetchone()
+                if not sch:
+                    continue
+                # Find or create a schedule for the to_teacher for this day
+                to_sch = db.session.execute(text("SELECT id FROM TeacherSchedule WHERE teacher_id = :tid AND day = :day"), {'tid': req.to_teacher_id, 'day': sch.day}).fetchone()
+                if not to_sch:
+                    # Create schedule for this day
+                    new_sch = db.session.execute(text("INSERT INTO TeacherSchedule (day, teacher_id) OUTPUT inserted.id VALUES (:day, :tid)"), {'day': sch.day, 'tid': req.to_teacher_id})
+                    to_sch_id = new_sch.scalar()
+                else:
+                    to_sch_id = to_sch.id
+                # Update slot to new schedule
+                db.session.execute(text("UPDATE Slot SET sch_id = :new_sch_id WHERE slot_id = :slot_id"), {'new_sch_id': to_sch_id, 'slot_id': slot_id})
+        # Update request status
+        db.session.execute(text("UPDATE SlotInchargeRequest SET status = :status, responded_at = GETDATE() WHERE id = :id"), {'status': response, 'id': request_id})
+        db.session.commit()
+        return jsonify({'message': f'Request {response}ed successfully'}), 200
+    except SQLAlchemyError as e:
+        db.session.rollback()
+        return jsonify({'error': 'Failed to respond to request', 'details': str(e)}), 500
+
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    print("UNCAUGHT EXCEPTION:", e)
+    traceback.print_exc()
+    return jsonify({"error": "Internal server error", "details": str(e)}), 500
+
+
+
+def get_user_region(role, username):
+    role = role.lower()
+    if role == "teacher":
+        query = text("SELECT region FROM Teacher WHERE username = :username")
+    elif role == "parent":
+        query = text("SELECT region FROM Parent WHERE username = :username")
+    elif role == "student":
+        query = text("SELECT region FROM Student WHERE username = :username")
+    else:
+        return None
+    result = db.session.execute(query, {"username": username}).fetchone()
+    if result:
+        return result.region
+    return None
+
+@app.route('/api/get_user_region', methods=['GET'])
+def api_get_user_region():
+    role = request.args.get('role', '').lower()
+    username = request.args.get('username', '')
+    if not role or not username:
+        return jsonify({'error': 'role and username are required'}), 400
+    region = get_user_region(role, username)
+    if region is None:
+        return jsonify({'error': 'Region not found for user'}), 404
+    return jsonify({'region': region})
+
+def check_slot_swap_info(slot_id):
+
+    # Check if this slot was part of an accepted transfer request
+    swap_query = text("""
+        SELECT 
+            r.id as request_id,
+            t1.username as original_teacher,
+            t2.username as new_teacher,
+            r.created_at,
+            r.responded_at
+        FROM SlotInchargeRequest r
+        JOIN Teacher t1 ON r.from_teacher_id = t1.id
+        JOIN Teacher t2 ON r.to_teacher_id = t2.id
+        WHERE r.status = 'accept' 
+        AND r.slot_ids LIKE :slot_id_pattern
+    """)
+    
+    # Create pattern to match slot_id in the comma-separated list
+    slot_id_pattern = f'%{slot_id}%'
+    result = db.session.execute(swap_query, {'slot_id_pattern': slot_id_pattern}).fetchone()
+    
+    if result:
+        return {
+            'requestId': result.request_id,
+            'originalTeacher': result.original_teacher,
+            'newTeacher': result.new_teacher,
+            'transferDate': str(result.responded_at) if result.responded_at else str(result.created_at),
+            'isSwapped': True
+        }
+    return None
+
+@app.route("/GetParentChildren", methods=["GET"])
+def GetParentChildren():
+    username = request.args.get("username")
+    if not username:
+        return jsonify({"error": "Username is required"}), 400
+
+    # Get parent id from username
+    parent = db.session.execute(
+        text("SELECT id FROM Parent WHERE username = :username"),
+        {"username": username}
+    ).fetchone()
+    if not parent:
+        return jsonify({"error": "Parent not found"}), 404
+
+    parent_id = parent.id
+
+    # Get all children for this parent
+    children = db.session.execute(text("""
+        SELECT 
+            s.id,
+            s.name,
+            s.username,
+            s.pic AS avatar,
+            s.dob,
+            s.gender,
+            s.region
+        FROM Student s
+        WHERE s.parent_id = :parent_id
+        ORDER BY s.name
+    """), {"parent_id": parent_id}).fetchall()
+
+    children_list = []
+    for child in children:
+        dob = child.dob
+        age = None
+        if dob:
+            today = datetime.today()
+            age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+
+        # Fetch courses for this child
+        courses = db.session.execute(text("""
+            SELECT c.id, c.name, c.description
+            FROM Enrollment e
+            JOIN Course c ON e.course_id = c.id
+            WHERE e.student_id = :student_id
+        """), {"student_id": child.id}).fetchall()
+        courses_list = [
+            {
+                "id": course.id,
+                "name": course.name,
+                "description": course.description
+            }
+            for course in courses
+        ]
+
+        children_list.append({
+            "id": child.id,
+            "name": child.name,
+            "username": child.username,
+            "avatar": child.avatar or "/placeholder.svg",
+            "age": age,
+            "gender": child.gender,
+            "region": child.region,
+            "courses": courses_list
+        })
+
+    return jsonify({"children": children_list}), 200
+
+@app.route('/agora/token', methods=['GET'])
+def generate_agora_token():
+    channel_name = request.args.get('channel')
+    uid = request.args.get('uid', '0')  # '0' means let Agora assign a UID
+    role = request.args.get('role', 'publisher')  # or 'subscriber'
+    expire_time_seconds = 3600  # 1 hour
+
+    if not channel_name:
+        return jsonify({'error': 'Channel name is required'}), 400
+
+    # Agora roles: 1 = publisher, 2 = subscriber
+    if role == 'publisher':
+        agora_role = 1
+    else:
+        agora_role = 2
+
+    current_timestamp = int(datetime.utcnow().timestamp())
+    privilege_expired_ts = current_timestamp + expire_time_seconds
+
+    token = RtcTokenBuilder.buildTokenWithUid(
+        AGORA_APP_ID, AGORA_APP_CERTIFICATE,
+        channel_name, int(uid), agora_role, privilege_expired_ts
+    )
+
+    return jsonify({
+        'appId': AGORA_APP_ID,
+        'token': token,
+        'channel': channel_name,
+        'uid': uid,
+        'expireAt': privilege_expired_ts
+    })
+
+# Start a video call session
+@app.route('/api/video-call/start', methods=['POST'])
+def start_video_call():
+    data = request.json
+    teacher_id = data.get('teacherId')
+    student_id = data.get('studentId')
+    slot_id = data.get('slotId')
+    room_id = data.get('roomId')
+    course_id = data.get('courseId')
+    now = datetime.utcnow()
+    if not all([teacher_id, student_id, slot_id, room_id, course_id]):
+        return jsonify({'error': 'Missing required fields'}), 400
+
+    # If teacher_id or student_id are strings (usernames), look up their IDs
+    if isinstance(teacher_id, str) and not teacher_id.isdigit():
+        teacher_id_lookup = db.session.execute(
+            text("SELECT id FROM Teacher WHERE username = :username"),
+            {"username": teacher_id}
+        ).fetchone()
+        if not teacher_id_lookup:
+            return jsonify({'error': 'Teacher username not found'}), 404
+        teacher_id = teacher_id_lookup.id
+    if isinstance(student_id, str) and not student_id.isdigit():
+        student_id_lookup = db.session.execute(
+            text("SELECT id FROM Student WHERE username = :username"),
+            {"username": student_id}
+        ).fetchone()
+        if not student_id_lookup:
+            return jsonify({'error': 'Student username not found'}), 404
+        student_id = student_id_lookup.id
+
+    insert_query = text('''
+        INSERT INTO VideoCallSession
+            (TeacherID, StudentID, SlotID, RoomID, CourseId, CallStartTime, Status, CreatedAt)
+        OUTPUT inserted.SessionID
+        VALUES
+            (:teacher_id, :student_id, :slot_id, :room_id, :course_id, :call_start_time, 'started', :created_at)
+    ''')
+    session_id = db.session.execute(insert_query, {
+        'teacher_id': teacher_id,
+        'student_id': student_id,
+        'slot_id': slot_id,
+        'room_id': room_id,
+        'course_id': course_id,
+        'call_start_time': now,
+        'created_at': now
+    }).scalar()
+    db.session.commit()
+    session = db.session.execute(text("SELECT * FROM VideoCallSession WHERE SessionID = :session_id"), {"session_id": session_id}).fetchone()
+    return jsonify(dict(session._mapping)), 201
+
+# Check for active call
+@app.route('/api/video-call/active', methods=['GET'])
+def check_active_video_call():
+    student_id = request.args.get('studentId')
+    slot_id = request.args.get('slotId')
+    if not student_id or not slot_id:
+        return jsonify({'error': 'studentId and slotId are required'}), 400
+
+    # If student_id is not an integer, look up by username
+    if isinstance(student_id, str) and not student_id.isdigit():
+        student_id_lookup = db.session.execute(
+            text("SELECT id FROM Student WHERE username = :username"),
+            {"username": student_id}
+        ).fetchone()
+        if not student_id_lookup:
+            return jsonify({'error': 'Student username not found'}), 404
+        student_id = student_id_lookup.id
+
+    session = db.session.execute(text('''
+        SELECT * FROM VideoCallSession
+        WHERE StudentID = :student_id AND SlotID = :slot_id AND Status = 'started'
+    '''), {'student_id': student_id, 'slot_id': slot_id}).fetchone()
+    return jsonify({'active': bool(session), 'session': dict(session._mapping) if session else None})
+
+# End a video call session
+@app.route('/api/video-call/end', methods=['POST'])
+def end_video_call():
+    data = request.json
+    session_id = data.get('sessionId')
+    call_end_time = data.get('callEndTime')
+    if not session_id:
+        return jsonify({'error': 'sessionId is required'}), 400
+    session = db.session.execute(text("SELECT * FROM VideoCallSession WHERE SessionID = :session_id"), {"session_id": session_id}).fetchone()
+    if not session:
+        return jsonify({'error': 'Session not found'}), 404
+    now = datetime.utcnow() if not call_end_time else datetime.fromisoformat(call_end_time)
+    db.session.execute(text('''
+        UPDATE VideoCallSession
+        SET Status = 'ended', CallEndTime = :call_end_time
+        WHERE SessionID = :session_id
+    '''), {'call_end_time': now, 'session_id': session_id})
+    db.session.commit()
+    return jsonify({'success': True})
+
+# Utility function to store all booked slots in VideoCallSession
+@app.route('/storing-classes', methods=['POST'])
+def store_booked_slots_in_videocallsession():
+    # Find all slots that are booked
+    slots = db.session.execute(text('''
+        SELECT s.slot_id, s.sch_id, s.Course_id, s.booked, ts.teacher_id, e.student_id
+        FROM Slot s
+        JOIN TeacherSchedule ts ON s.sch_id = ts.id
+        LEFT JOIN Enrollment e ON e.qari_id = ts.teacher_id AND e.course_id = s.Course_id
+        WHERE s.booked = 1
+    ''')).fetchall()
+    now = datetime.utcnow()
+    inserted = 0
+    for slot in slots:
+        # Check if a VideoCallSession already exists for this slot
+        exists = db.session.execute(text('''
+            SELECT 1 FROM VideoCallSession WHERE SlotID = :slot_id
+        '''), {'slot_id': slot.slot_id}).fetchone()
+        if exists:
+            continue
+        # Insert new VideoCallSession
+        db.session.execute(text('''
+            INSERT INTO VideoCallSession (TeacherID, StudentID, SlotID, CourseId, RoomID, Status, CreatedAt)
+            VALUES (:teacher_id, :student_id, :slot_id, :course_id, :room_id, 'scheduled', :created_at)
+        '''), {
+            'teacher_id': slot.teacher_id,
+            'student_id': slot.student_id,
+            'slot_id': slot.slot_id,
+            'course_id': slot.Course_id,
+            'room_id': f"slot-{slot.slot_id}",
+            'created_at': now
+        })
+        inserted += 1
+    db.session.commit()
+    return inserted
+
+@app.route('/GetRukuText', methods=['GET'])
+def get_ruku_text():
+    # Get surah_name and ruku_id from query params
+    surah_name = request.args.get('surah_name')
+    ruku_id = request.args.get('ruku_id', type=int)
+    if not surah_name or not ruku_id:
+        return jsonify({'error': 'surah_name and ruku_id are required'}), 400
+
+    # 1. Get SurahNo from SurahName
+    surah_row = db.session.execute(text("""
+        SELECT SurahNo FROM Surah WHERE SurahName = :surah_name
+    """), {'surah_name': surah_name}).fetchone()
+    if not surah_row:
+        return jsonify({'error': 'Surah name not found'}), 404
+    surah_no = surah_row.SurahNo
+
+    # 2. Get Ruku range
+    ruku_row = db.session.execute(text("""
+        SELECT StartingAyahNo, EndingAyahNo
+        FROM Ruku
+        WHERE SurahNo = :surah_no AND RukuNo = :ruku_id
+    """), {'surah_no': surah_no, 'ruku_id': ruku_id}).fetchone()
+
+    if not ruku_row:
+        return jsonify({'error': 'Ruku not found'}), 404
+
+    start_ayah, end_ayah = ruku_row.StartingAyahNo, ruku_row.EndingAyahNo
+
+    # 3. Get Ayahs from Quran table
+    ayahs = db.session.execute(text("""
+        SELECT VerseID, AyahText
+        FROM Quran
+        WHERE SuraID = :surah_no AND VerseID BETWEEN :start_ayah AND :end_ayah
+        ORDER BY VerseID
+    """), {'surah_no': surah_no, 'start_ayah': start_ayah, 'end_ayah': end_ayah}).fetchall()
+
+    ayah_list = [{'verse': row.VerseID, 'text': row.AyahText} for row in ayahs]
+
+    return jsonify({
+        'surah_no': surah_no,
+        'surah_name': surah_name,
+        'ruku_id': ruku_id,
+        'start_ayah': start_ayah,
+        'end_ayah': end_ayah,
+        'ayahs': ayah_list
+    })
+
+# --- New Endpoints for Per-Student Bookmarks and Status ---
+from flask import request, jsonify
+from sqlalchemy import text
+
+@app.route('/api/lesson-details', methods=['GET'])
+def get_lesson_details():
+    role = request.args.get('role')
+    username = request.args.get('username')
+    surah_name = request.args.get('surah_name')
+    ruku_id = request.args.get('ruku_id', type=int)
+    if not role or not username or not surah_name or not ruku_id:
+        return jsonify({'error': 'role, username, surah_name, and ruku_id are required'}), 400
+
+    # 1. Get user id (student/teacher/parent)
+    if role.lower() == 'student':
+        user_row = db.session.execute(text("SELECT id FROM Student WHERE username = :u"), {'u': username}).fetchone()
+        if not user_row:
+            return jsonify({'error': 'Student not found'}), 404
+        student_id = user_row.id
+    elif role.lower() == 'parent':
+        # For parent, need a child username (for now, treat as student)
+        user_row = db.session.execute(text("SELECT id FROM Student WHERE username = :u"), {'u': username}).fetchone()
+        if not user_row:
+            return jsonify({'error': 'Student (child) not found'}), 404
+        student_id = user_row.id
+    elif role.lower() == 'teacher':
+        # For teacher, can optionally pass student_username to view a student's progress
+        student_username = request.args.get('student_username')
+        if not student_username:
+            return jsonify({'error': 'student_username required for teacher'}), 400
+        user_row = db.session.execute(text("SELECT id FROM Student WHERE username = :u"), {'u': student_username}).fetchone()
+        if not user_row:
+            return jsonify({'error': 'Student not found'}), 404
+        student_id = user_row.id
+    else:
+        return jsonify({'error': 'Invalid role'}), 400
+
+    # 2. Get SurahNo
+    surah_row = db.session.execute(text("SELECT SurahNo FROM Surah WHERE SurahName = :name"), {'name': surah_name}).fetchone()
+    if not surah_row:
+        return jsonify({'error': 'Surah not found'}), 404
+    surah_no = surah_row.SurahNo
+
+    # 3. Get lesson_id from QuranLessons
+    lesson_row = db.session.execute(text("""
+        SELECT ql.ID FROM QuranLessons ql
+        WHERE ql.SurahNo = :surah_no AND ql.RukuID = :ruku_id
+    """), {'surah_no': surah_no, 'ruku_id': ruku_id}).fetchone()
+    if not lesson_row:
+        return jsonify({'error': 'Lesson not found'}), 404
+    lesson_id = lesson_row.ID
+
+    # 4. Get StudentLessonProgress row
+    slp_row = db.session.execute(text("""
+        SELECT status, AyahPointer FROM StudentLessonProgress
+        WHERE student_id = :student_id AND lesson_id = :lesson_id
+    """), {'student_id': student_id, 'lesson_id': lesson_id}).fetchone()
+    status = slp_row.status if slp_row else 0
+    ayah_pointer = slp_row.AyahPointer if slp_row else None
+
+    # 5. Get Ruku range
+    ruku_row = db.session.execute(text("""
+        SELECT StartingAyahNo, EndingAyahNo
+        FROM Ruku
+        WHERE SurahNo = :surah_no AND RukuNo = :ruku_id
+    """), {'surah_no': surah_no, 'ruku_id': ruku_id}).fetchone()
+    if not ruku_row:
+        return jsonify({'error': 'Ruku not found'}), 404
+    start_ayah, end_ayah = ruku_row.StartingAyahNo, ruku_row.EndingAyahNo
+
+    # 6. Get Quranic text
+    ayahs = db.session.execute(text("""
+        SELECT VerseID, AyahText
+        FROM Quran
+        WHERE SuraID = :surah_no AND VerseID BETWEEN :start_ayah AND :end_ayah
+        ORDER BY VerseID
+    """), {'surah_no': surah_no, 'start_ayah': start_ayah, 'end_ayah': end_ayah}).fetchall()
+    ayah_list = [{'verse': row.VerseID, 'text': row.AyahText} for row in ayahs]
+
+    return jsonify({
+        'surah_name': surah_name,
+        'ruku_id': ruku_id,
+        'ayahs': ayah_list,
+        'status': status,
+        'bookmark': ayah_pointer
+    })
+
+@app.route('/api/lesson-bookmark', methods=['POST'])
+def set_lesson_bookmark():
+    data = request.json
+    username = data.get('username')
+    surah_name = data.get('surah_name')
+    ruku_id = data.get('ruku_id')
+    ayah_no = data.get('ayah_no')
+    if not username or not surah_name or not ruku_id or not ayah_no:
+        return jsonify({'error': 'username, surah_name, ruku_id, and ayah_no are required'}), 400
+    # Get student id
+    user_row = db.session.execute(text("SELECT id FROM Student WHERE username = :u"), {'u': username}).fetchone()
+    if not user_row:
+        return jsonify({'error': 'Student not found'}), 404
+    student_id = user_row.id
+    # Get SurahNo
+    surah_row = db.session.execute(text("SELECT SurahNo FROM Surah WHERE SurahName = :name"), {'name': surah_name}).fetchone()
+    if not surah_row:
+        return jsonify({'error': 'Surah not found'}), 404
+    surah_no = surah_row.SurahNo
+    # Get lesson_id
+    lesson_row = db.session.execute(text("SELECT ID FROM QuranLessons WHERE SurahNo = :surah_no AND RukuID = :ruku_id"), {'surah_no': surah_no, 'ruku_id': ruku_id}).fetchone()
+    if not lesson_row:
+        return jsonify({'error': 'Lesson not found'}), 404
+    lesson_id = lesson_row.ID
+    # Update or insert StudentLessonProgress
+    slp_row = db.session.execute(text("SELECT id FROM StudentLessonProgress WHERE student_id = :student_id AND lesson_id = :lesson_id"), {'student_id': student_id, 'lesson_id': lesson_id}).fetchone()
+    if slp_row:
+        db.session.execute(text("UPDATE StudentLessonProgress SET AyahPointer = :ayah_no WHERE id = :id"), {'ayah_no': ayah_no, 'id': slp_row.id})
+    else:
+        db.session.execute(text("INSERT INTO StudentLessonProgress (student_id, lesson_id, AyahPointer) VALUES (:student_id, :lesson_id, :ayah_no)"), {'student_id': student_id, 'lesson_id': lesson_id, 'ayah_no': ayah_no})
+    db.session.commit()
+    return jsonify({'success': True, 'bookmark': ayah_no})
+
+@app.route('/api/lesson-status', methods=['POST'])
+def set_lesson_status():
+    data = request.json
+    student_username = data.get('student_username')
+    surah_name = data.get('surah_name')
+    ruku_id = data.get('ruku_id')
+    status = data.get('status')
+    if not student_username or not surah_name or not ruku_id or status is None:
+        return jsonify({'error': 'student_username, surah_name, ruku_id, and status are required'}), 400
+    # Get student id
+    user_row = db.session.execute(text("SELECT id FROM Student WHERE username = :u"), {'u': student_username}).fetchone()
+    if not user_row:
+        return jsonify({'error': 'Student not found'}), 404
+    student_id = user_row.id
+    # Get SurahNo
+    surah_row = db.session.execute(text("SELECT SurahNo FROM Surah WHERE SurahName = :name"), {'name': surah_name}).fetchone()
+    if not surah_row:
+        return jsonify({'error': 'Surah not found'}), 404
+    surah_no = surah_row.SurahNo
+    # Get lesson_id
+    lesson_row = db.session.execute(text("SELECT ID FROM QuranLessons WHERE SurahNo = :surah_no AND RukuID = :ruku_id"), {'surah_no': surah_no, 'ruku_id': ruku_id}).fetchone()
+    if not lesson_row:
+        return jsonify({'error': 'Lesson not found'}), 404
+    lesson_id = lesson_row.ID
+    # Update or insert StudentLessonProgress
+    slp_row = db.session.execute(text("SELECT id FROM StudentLessonProgress WHERE student_id = :student_id AND lesson_id = :lesson_id"), {'student_id': student_id, 'lesson_id': lesson_id}).fetchone()
+    if slp_row:
+        db.session.execute(text("UPDATE StudentLessonProgress SET status = :status WHERE id = :id"), {'status': status, 'id': slp_row.id})
+    else:
+        db.session.execute(text("INSERT INTO StudentLessonProgress (student_id, lesson_id, status) VALUES (:student_id, :lesson_id, :status)"), {'student_id': student_id, 'lesson_id': lesson_id, 'status': status})
+    db.session.commit()
+    return jsonify({'success': True, 'status': status})
 
 app.run(debug=True)
