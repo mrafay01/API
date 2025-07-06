@@ -1,3 +1,6 @@
+import eventlet
+eventlet.monkey_patch()
+
 import base64
 import datetime
 import os
@@ -10,6 +13,7 @@ from sqlalchemy.exc import SQLAlchemyError
 import traceback
 import random
 import string
+from flask_socketio import SocketIO, emit, join_room, leave_room
 
 # If you installed via pip
 # from agora_token_builder import RtcTokenBuilder
@@ -17,8 +21,7 @@ import string
 from agora_token_builder import RtcTokenBuilder
 
 app = Flask("QuranAPI")
-
-CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 CORS(app)
 
@@ -1157,14 +1160,15 @@ def fetch_children_for_parent(username):
     children = db.session.execute(text("""
         SELECT 
             s.id,
-            s.name,
+            s.name,                                       
+            s.username,
             s.pic AS avatar,
             s.dob,
             MIN(e.start_date) AS enrolledDate  -- earliest enrollment date
         FROM Student s
         LEFT JOIN Enrollment e ON e.student_id = s.id
         WHERE s.parent_id = :parent_id
-        GROUP BY s.id, s.name, s.pic, s.dob
+        GROUP BY s.id, s.name, s.username, s.pic, s.dob
     """), {"parent_id": parent_id}).fetchall()
     return children, None
 
@@ -1186,18 +1190,23 @@ def get_children_progress():
             today = datetime.today()
             age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
 
-        # Get overall progress using actual lesson progress
-        progress_query = text("""
-            SELECT 
-                COUNT(*) AS total_lessons,
-                SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) AS completed_lessons
-            FROM StudentLessonProgress 
-            WHERE student_id = :student_id
+        total_lessons_query = text("""
+            SELECT COUNT(*) AS total_lessons
+            FROM QuranLessons ql
+            JOIN Enrollment e ON ql.CourseID = e.course_id
+            WHERE e.student_id = :student_id
         """)
-        progress_result = db.session.execute(progress_query, {"student_id": child.id}).fetchone()
+        total_lessons_result = db.session.execute(total_lessons_query, {"student_id": child.id}).fetchone()
+        total_lessons = total_lessons_result.total_lessons or 0
         
-        total_lessons = progress_result.total_lessons or 0
-        completed_lessons = progress_result.completed_lessons or 0
+        completed_lessons_query = text("""
+            SELECT COUNT(*) AS completed_lessons
+            FROM StudentLessonProgress 
+            WHERE student_id = :student_id AND status = 1
+        """)
+        completed_lessons_result = db.session.execute(completed_lessons_query, {"student_id": child.id}).fetchone()
+        completed_lessons = completed_lessons_result.completed_lessons or 0
+        
         overall_progress = int((completed_lessons / total_lessons) * 100) if total_lessons > 0 else 0
 
         # Get total hours from video call sessions
@@ -1206,8 +1215,32 @@ def get_children_progress():
             {"student_id": child.id}
         ).scalar()
 
+        # Get enrolled courses for this child, including teacher name
+        courses = db.session.execute(text("""
+            SELECT c.id, c.name, c.description, t.username AS t_username
+            FROM Enrollment e
+            JOIN Course c ON e.course_id = c.id
+            JOIN Teacher t ON e.qari_id = t.id
+            WHERE e.student_id = :student_id
+        """), {"student_id": child.id}).fetchall()
+        courses_list = []
+        for course in courses:
+            # Get total lessons for this course
+            total_course_lessons = db.session.execute(
+                text("SELECT COUNT(*) FROM QuranLessons WHERE CourseID = :course_id"),
+                {"course_id": course.id}
+            ).scalar() or 0
+            courses_list.append({
+                "id": course.id,
+                "name": course.name,
+                "description": course.description,
+                "teacher_username": course.t_username,
+                "totalLessons": total_course_lessons
+            })
+
         children_list.append({
             "id": child.id,
+            "username": child.username,
             "name": child.name,
             "avatar": child.avatar or "",  
             "age": age,
@@ -1215,7 +1248,8 @@ def get_children_progress():
             "overallProgress": overall_progress,
             "totalHours": round(total_hours or 0, 1),
             "totalLessons": total_lessons,
-            "completedLessons": completed_lessons
+            "completedLessons": completed_lessons,
+            "courses": courses_list
         })
 
     return jsonify({"children": children_list})
@@ -2620,7 +2654,7 @@ def GetCourseLessons():
         lesson_list.append({
             "lessonId": lesson.id,
             "title": lesson.name,
-            "completed": bool(status_map.get(lesson.id, 0))
+            "completed": bool(status_map.get(lesson.id, 0) == 1)
         })
 
     return jsonify({
@@ -3209,8 +3243,12 @@ def get_lesson_details():
     username = request.args.get('username')
     surah_name = request.args.get('surah_name')
     ruku_id = request.args.get('ruku_id', type=int)
-    if not role or not username or not surah_name or not ruku_id:
-        return jsonify({'error': 'role, username, surah_name, and ruku_id are required'}), 400
+    teacher_username = request.args.get('teacher_username')
+    course_id = request.args.get('course_id')
+
+    print("DEBUG:", role, username, surah_name, ruku_id, course_id, teacher_username)
+    if not role or not username or not surah_name or not ruku_id or not teacher_username or not course_id:
+        return jsonify({'error': 'role, username, surah_name, ruku_id, teacher_username, and course_id are required'}), 400
 
     # 1. Get user id (student/teacher/parent)
     if role.lower() == 'student':
@@ -3219,13 +3257,11 @@ def get_lesson_details():
             return jsonify({'error': 'Student not found'}), 404
         student_id = user_row.id
     elif role.lower() == 'parent':
-        # For parent, need a child username (for now, treat as student)
         user_row = db.session.execute(text("SELECT id FROM Student WHERE username = :u"), {'u': username}).fetchone()
         if not user_row:
             return jsonify({'error': 'Student (child) not found'}), 404
         student_id = user_row.id
     elif role.lower() == 'teacher':
-        # For teacher, can optionally pass student_username to view a student's progress
         student_username = request.args.get('student_username')
         if not student_username:
             return jsonify({'error': 'student_username required for teacher'}), 400
@@ -3242,24 +3278,28 @@ def get_lesson_details():
         return jsonify({'error': 'Surah not found'}), 404
     surah_no = surah_row.SurahNo
 
-    # 3. Get lesson_id from QuranLessons
-    lesson_row = db.session.execute(text("""
-        SELECT ql.ID FROM QuranLessons ql
-        WHERE ql.SurahNo = :surah_no AND ql.RukuID = :ruku_id
-    """), {'surah_no': surah_no, 'ruku_id': ruku_id}).fetchone()
+    # 3. Get lesson_id and course_id
+    lesson_row = db.session.execute(
+        text("SELECT ID, CourseID FROM QuranLessons WHERE SurahNo = :surah_no AND RukuID = :ruku_id AND CourseID = :course_id"),
+        {'surah_no': surah_no, 'ruku_id': ruku_id, 'course_id': course_id}
+    ).fetchone()
     if not lesson_row:
         return jsonify({'error': 'Lesson not found'}), 404
     lesson_id = lesson_row.ID
 
-    # 4. Get StudentLessonProgress row
+    # 4. Get teacher_id from teacher_username
+    teacher_row = db.session.execute(text("SELECT id FROM Teacher WHERE username = :username"), {'username': teacher_username}).fetchone()
+    teacher_id = teacher_row.id if teacher_row else None
+
+    # 5. Get StudentLessonProgress row
     slp_row = db.session.execute(text("""
         SELECT status, AyahPointer FROM StudentLessonProgress
-        WHERE student_id = :student_id AND lesson_id = :lesson_id
-    """), {'student_id': student_id, 'lesson_id': lesson_id}).fetchone()
+        WHERE student_id = :student_id AND lesson_id = :lesson_id AND course_id = :course_id AND teacher_id = :teacher_id
+    """), {'student_id': student_id, 'lesson_id': lesson_id, 'course_id': course_id, 'teacher_id': teacher_id}).fetchone()
     status = slp_row.status if slp_row else 0
     ayah_pointer = slp_row.AyahPointer if slp_row else None
 
-    # 5. Get Ruku range
+    # 6. Get Ruku range
     ruku_row = db.session.execute(text("""
         SELECT StartingAyahNo, EndingAyahNo
         FROM Ruku
@@ -3269,7 +3309,7 @@ def get_lesson_details():
         return jsonify({'error': 'Ruku not found'}), 404
     start_ayah, end_ayah = ruku_row.StartingAyahNo, ruku_row.EndingAyahNo
 
-    # 6. Get Quranic text
+    # 7. Get Quranic text
     ayahs = db.session.execute(text("""
         SELECT VerseID, AyahText
         FROM Quran
@@ -3293,63 +3333,235 @@ def set_lesson_bookmark():
     surah_name = data.get('surah_name')
     ruku_id = data.get('ruku_id')
     ayah_no = data.get('ayah_no')
-    if not username or not surah_name or not ruku_id or not ayah_no:
-        return jsonify({'error': 'username, surah_name, ruku_id, and ayah_no are required'}), 400
-    # Get student id
-    user_row = db.session.execute(text("SELECT id FROM Student WHERE username = :u"), {'u': username}).fetchone()
-    if not user_row:
-        return jsonify({'error': 'Student not found'}), 404
-    student_id = user_row.id
-    # Get SurahNo
-    surah_row = db.session.execute(text("SELECT SurahNo FROM Surah WHERE SurahName = :name"), {'name': surah_name}).fetchone()
-    if not surah_row:
-        return jsonify({'error': 'Surah not found'}), 404
-    surah_no = surah_row.SurahNo
-    # Get lesson_id
-    lesson_row = db.session.execute(text("SELECT ID FROM QuranLessons WHERE SurahNo = :surah_no AND RukuID = :ruku_id"), {'surah_no': surah_no, 'ruku_id': ruku_id}).fetchone()
-    if not lesson_row:
-        return jsonify({'error': 'Lesson not found'}), 404
-    lesson_id = lesson_row.ID
-    # Update or insert StudentLessonProgress
-    slp_row = db.session.execute(text("SELECT id FROM StudentLessonProgress WHERE student_id = :student_id AND lesson_id = :lesson_id"), {'student_id': student_id, 'lesson_id': lesson_id}).fetchone()
-    if slp_row:
-        db.session.execute(text("UPDATE StudentLessonProgress SET AyahPointer = :ayah_no WHERE id = :id"), {'ayah_no': ayah_no, 'id': slp_row.id})
-    else:
-        db.session.execute(text("INSERT INTO StudentLessonProgress (student_id, lesson_id, AyahPointer) VALUES (:student_id, :lesson_id, :ayah_no)"), {'student_id': student_id, 'lesson_id': lesson_id, 'ayah_no': ayah_no})
-    db.session.commit()
-    return jsonify({'success': True, 'bookmark': ayah_no})
+    teacher_username = data.get('teacher_username')
+    course_id = data.get('course_id')
+    
+    if not username or not surah_name or not ruku_id or not ayah_no or not teacher_username or not course_id:
+        return jsonify({'error': 'username, surah_name, ruku_id, ayah_no, teacher_username, and course_id are required'}), 400
+    
+    try:
+        # Optimized: Combine multiple queries into one for better performance
+        combined_query = text("""
+            SELECT 
+                s.id as student_id,
+                su.SurahNo,
+                ql.ID as lesson_id,
+                t.id as teacher_id
+            FROM Student s
+            JOIN Surah su ON su.SurahName = :surah_name
+            JOIN QuranLessons ql ON ql.SurahNo = su.SurahNo AND ql.RukuID = :ruku_id AND ql.CourseID = :course_id
+            JOIN Teacher t ON t.username = :teacher_username
+            WHERE s.username = :username
+        """)
+        
+        result = db.session.execute(combined_query, {
+            'username': username,
+            'surah_name': surah_name,
+            'ruku_id': ruku_id,
+            'course_id': course_id,
+            'teacher_username': teacher_username
+        }).fetchone()
+        
+        if not result:
+            return jsonify({'error': 'Student, lesson, or teacher not found'}), 404
+            
+        student_id = result.student_id
+        lesson_id = result.lesson_id
+        teacher_id = result.teacher_id
+        
+        # Optimized: Use UPSERT pattern for better performance
+        upsert_query = text("""
+            MERGE StudentLessonProgress AS target
+            USING (SELECT :student_id as student_id, :lesson_id as lesson_id) AS source
+            ON target.student_id = source.student_id AND target.lesson_id = source.lesson_id
+            WHEN MATCHED THEN
+                UPDATE SET AyahPointer = :ayah_no, teacher_id = :teacher_id
+            WHEN NOT MATCHED THEN
+                INSERT (student_id, lesson_id, course_id, teacher_id, AyahPointer)
+                VALUES (:student_id, :lesson_id, :course_id, :teacher_id, :ayah_no);
+        """)
+        
+        db.session.execute(upsert_query, {
+            'student_id': student_id,
+            'lesson_id': lesson_id,
+            'course_id': course_id,
+            'teacher_id': teacher_id,
+            'ayah_no': ayah_no
+        })
+        
+        db.session.commit()
+        
+        # Emit socket event for real-time updates
+        socketio.emit(
+            'bookmark_update',
+            {
+                'student_id': student_id,
+                'lesson_id': lesson_id,
+                'course_id': course_id,
+                'teacher_id': teacher_id,
+                'ayah_no': ayah_no,
+                'timestamp': datetime.utcnow().isoformat()
+            },
+            room=f"student_{student_id}"
+        )
+        
+        return jsonify({
+            'success': True, 
+            'bookmark': ayah_no,
+            'student_id': student_id,
+            'lesson_id': lesson_id
+        })
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"Bookmark error: {e}")
+        return jsonify({'error': 'Failed to update bookmark', 'details': str(e)}), 500
 
 @app.route('/api/lesson-status', methods=['POST'])
 def set_lesson_status():
     data = request.json
     student_username = data.get('student_username')
     surah_name = data.get('surah_name')
+    course_id = data.get('course_id')
     ruku_id = data.get('ruku_id')
     status = data.get('status')
-    if not student_username or not surah_name or not ruku_id or status is None:
-        return jsonify({'error': 'student_username, surah_name, ruku_id, and status are required'}), 400
-    # Get student id
-    user_row = db.session.execute(text("SELECT id FROM Student WHERE username = :u"), {'u': student_username}).fetchone()
-    if not user_row:
-        return jsonify({'error': 'Student not found'}), 404
-    student_id = user_row.id
-    # Get SurahNo
-    surah_row = db.session.execute(text("SELECT SurahNo FROM Surah WHERE SurahName = :name"), {'name': surah_name}).fetchone()
-    if not surah_row:
-        return jsonify({'error': 'Surah not found'}), 404
-    surah_no = surah_row.SurahNo
-    # Get lesson_id
-    lesson_row = db.session.execute(text("SELECT ID FROM QuranLessons WHERE SurahNo = :surah_no AND RukuID = :ruku_id"), {'surah_no': surah_no, 'ruku_id': ruku_id}).fetchone()
-    if not lesson_row:
-        return jsonify({'error': 'Lesson not found'}), 404
-    lesson_id = lesson_row.ID
-    # Update or insert StudentLessonProgress
-    slp_row = db.session.execute(text("SELECT id FROM StudentLessonProgress WHERE student_id = :student_id AND lesson_id = :lesson_id"), {'student_id': student_id, 'lesson_id': lesson_id}).fetchone()
-    if slp_row:
-        db.session.execute(text("UPDATE StudentLessonProgress SET status = :status WHERE id = :id"), {'status': status, 'id': slp_row.id})
-    else:
-        db.session.execute(text("INSERT INTO StudentLessonProgress (student_id, lesson_id, status) VALUES (:student_id, :lesson_id, :status)"), {'student_id': student_id, 'lesson_id': lesson_id, 'status': status})
-    db.session.commit()
-    return jsonify({'success': True, 'status': status})
+    teacher_username = data.get('teacher_username')
+    print("DEBUG:", student_username, surah_name, ruku_id, course_id, teacher_username, status)
 
-app.run(debug=True)
+    if not student_username or not surah_name or not ruku_id or status is None or not teacher_username or not course_id:
+        return jsonify({'error': 'student_username, surah_name, ruku_id, course_id, teacher_username, and status are required'}), 400
+    
+    try:
+        # Optimized: Combine multiple queries into one for better performance
+        combined_query = text("""
+            SELECT 
+                s.id as student_id,
+                su.SurahNo,
+                ql.ID as lesson_id,
+                t.id as teacher_id
+            FROM Student s
+            JOIN Surah su ON su.SurahName = :surah_name
+            JOIN QuranLessons ql ON ql.SurahNo = su.SurahNo AND ql.RukuID = :ruku_id AND ql.CourseID = :course_id
+            JOIN Teacher t ON t.username = :teacher_username
+            WHERE s.username = :student_username
+        """)
+        
+        result = db.session.execute(combined_query, {
+            'student_username': student_username,
+            'surah_name': surah_name,
+            'ruku_id': ruku_id,
+            'course_id': course_id,
+            'teacher_username': teacher_username
+        }).fetchone()
+        
+        if not result:
+            return jsonify({'error': 'Student, lesson, or teacher not found'}), 404
+            
+        student_id = result.student_id
+        lesson_id = result.lesson_id
+        teacher_id = result.teacher_id
+        
+        # Optimized: Use UPSERT pattern for better performance
+        upsert_query = text("""
+            MERGE StudentLessonProgress AS target
+            USING (SELECT :student_id as student_id, :lesson_id as lesson_id) AS source
+            ON target.student_id = source.student_id AND target.lesson_id = source.lesson_id
+            WHEN MATCHED THEN
+                UPDATE SET status = :status, teacher_id = :teacher_id
+            WHEN NOT MATCHED THEN
+                INSERT (student_id, lesson_id, course_id, teacher_id, status)
+                VALUES (:student_id, :lesson_id, :course_id, :teacher_id, :status);
+        """)
+        
+        db.session.execute(upsert_query, {
+            'student_id': student_id,
+            'lesson_id': lesson_id,
+            'course_id': course_id,
+            'teacher_id': teacher_id,
+            'status': status
+        })
+        
+        db.session.commit()
+        
+        # Emit socket event for real-time updates
+        socketio.emit(
+            'lesson_status_update',
+            {
+                'student_id': student_id,
+                'lesson_id': lesson_id,
+                'course_id': course_id,
+                'teacher_id': teacher_id,
+                'status': status,
+                'timestamp': datetime.utcnow().isoformat()
+            },
+            room=f"student_{student_id}"
+        )
+        
+        return jsonify({
+            'success': True, 
+            'status': status,
+            'student_id': student_id,
+            'lesson_id': lesson_id
+        })
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"Lesson status error: {e}")
+        return jsonify({'error': 'Failed to update lesson status', 'details': str(e)}), 500
+
+@app.route("/GetStudentTeacher", methods=["GET"])
+def GetStudentTeacher():
+    username = request.args.get("username")
+    course_id = request.args.get("courseId")  # Accept courseId as a query param
+    if not username or not course_id:
+        return jsonify({"error": "Username and courseId are required"}), 400
+
+    # Get student ID
+    student = db.session.execute(
+        text("SELECT id FROM Student WHERE username = :username"),
+        {"username": username}
+    ).fetchone()
+    if not student:
+        return jsonify({"error": "Student not found"}), 404
+    student_id = student.id
+
+    # Get the teacher for this student and course
+    teacher = db.session.execute(text("""
+        SELECT TOP 1 t.id, t.username, t.name, t.region, t.gender, t.pic, t.qualification, t.bio
+        FROM Enrollment e
+        JOIN Teacher t ON e.qari_id = t.id
+        WHERE e.student_id = :student_id AND e.course_id = :course_id
+    """), {"student_id": student_id, "course_id": course_id}).fetchone()
+
+    if not teacher:
+        return jsonify({"error": "Teacher not found for this course"}), 404
+
+    teacher_data = {
+        "id": teacher.id,
+        "username": teacher.username,
+        "name": teacher.name,
+        "region": teacher.region,
+        "gender": teacher.gender,
+        "avatar": teacher.pic,
+        "qualification": teacher.qualification,
+        "bio": teacher.bio
+    }
+
+    return jsonify({"teacher": teacher_data}), 200
+
+@socketio.on('join')
+def on_join(data):
+    student_id = data.get('student_id')
+    if student_id:
+        join_room(f"student_{student_id}")
+        emit('joined', {'room': f"student_{student_id}"})
+
+@socketio.on('leave')
+def on_leave(data):
+    student_id = data.get('student_id')
+    if student_id:
+        leave_room(f"student_{student_id}")
+        emit('left', {'room': f"student_{student_id}"})
+
+if __name__ == '__main__':
+    socketio.run(app, debug=True, host='127.0.0.1', port=5000)
