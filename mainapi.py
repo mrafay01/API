@@ -2308,7 +2308,7 @@ def hire_teacher(username):
         """), {"student_id": student_id, "teacher_id": teacher_id, "course_id": course_id, "start_date": current_date})
         enrollment_id = enrollment_result.scalar()
         
-        # If slots are provided, book them
+        # If slots are provided, book them (multiple slots per enrollment)
         if selected_schedule and isinstance(selected_schedule, list):
             # Validate all slot IDs
             valid_slots = db.session.execute(
@@ -2319,12 +2319,12 @@ def hire_teacher(username):
                 if int(slot_id) not in valid_slot_ids:
                     db.session.rollback()
                     return jsonify({'error': f'Invalid or already booked slot ID: {slot_id}'}), 400
-            # Book slots and set Course_id
-            db.session.execute(
-                text(f"UPDATE Slot SET booked = 1, Course_id = :course_id WHERE slot_id IN ({','.join(str(int(sid)) for sid in selected_schedule)})"),
-                {"course_id": course_id}
-            )
+            # Book slots and set Course_id, and insert into BookedEnrollmentSlots
             for slot_id in selected_schedule:
+                db.session.execute(
+                    text("UPDATE Slot SET booked = 1, Course_id = :course_id WHERE slot_id = :slot_id"),
+                    {"course_id": course_id, "slot_id": int(slot_id)}
+                )
                 db.session.execute(
                     text("INSERT INTO BookedEnrollmentSlots (enrollment_id, slot_id) VALUES (:enrollment_id, :slot_id)"),
                     {"enrollment_id": enrollment_id, "slot_id": int(slot_id)}
@@ -2446,13 +2446,10 @@ def GetSchedule():
             return jsonify({'error': 'Teacher not found'}), 404
         teacher_id = teacher.id
         schedule_query = text("""
-            SELECT ts.id AS schedule_id, ts.day, s.slot_id, s.time, s.booked, s.sch_id, s.Course_id, c.name as course_name,
-                   st.username as student_username, st.name as student_name
+            SELECT ts.id AS schedule_id, ts.day, s.slot_id, s.time, s.booked, s.sch_id, s.Course_id, c.name as course_name
             FROM TeacherSchedule ts
             LEFT JOIN Slot s ON ts.id = s.sch_id
             LEFT JOIN Course c ON s.Course_id = c.id
-            LEFT JOIN Enrollment e ON e.qari_id = ts.teacher_id AND e.course_id = s.Course_id
-            LEFT JOIN Student st ON e.student_id = st.id
             WHERE ts.teacher_id = :id
             ORDER BY ts.day, s.time
         """)
@@ -2468,12 +2465,21 @@ def GetSchedule():
                 "course": {"courseId": row.Course_id, "courseName": row.course_name} if row.Course_id else None
             }
             
-            # Add student information if the slot is booked
-            if row.booked and row.student_username:
-                slot_info["student"] = {
-                    "username": row.student_username,
-                    "name": row.student_name
-                }
+            # Add student information if the slot is booked - get the specific student for this slot
+            if row.booked and row.slot_id:
+                student_query = text("""
+                    SELECT st.username, st.name
+                    FROM BookedEnrollmentSlots bes
+                    JOIN Enrollment e ON bes.enrollment_id = e.id
+                    JOIN Student st ON e.student_id = st.id
+                    WHERE bes.slot_id = :slot_id AND e.qari_id = :teacher_id
+                """)
+                student = db.session.execute(student_query, {'slot_id': row.slot_id, 'teacher_id': teacher_id}).fetchone()
+                if student:
+                    slot_info["student"] = {
+                        "username": student.username,
+                        "name": student.name
+                    }
             
             schedule_list.append(slot_info)
         return jsonify({'role': 'Teacher', 'schedule': schedule_list}), 200
@@ -2485,13 +2491,16 @@ def GetSchedule():
         slots_query = text("""
             SELECT s.slot_id, s.time, ts.day, s.booked, s.sch_id, s.Course_id, c.name as course_name, 
                    t.username as teacher_username, t.name as teacher_name
-            FROM Slot s
+            FROM BookedEnrollmentSlots bes
+            JOIN Enrollment e ON bes.enrollment_id = e.id
+            JOIN Slot s ON bes.slot_id = s.slot_id
             JOIN TeacherSchedule ts ON s.sch_id = ts.id
             LEFT JOIN Course c ON s.Course_id = c.id
             JOIN Teacher t ON ts.teacher_id = t.id
+            WHERE e.student_id = :student_id
             ORDER BY ts.day, s.time
         """)
-        slots = db.session.execute(slots_query).fetchall()
+        slots = db.session.execute(slots_query, {"student_id": student_id}).fetchall()
         slot_list = []
         for slot in slots:
             # Check if this slot has been swapped/transferred
@@ -2525,18 +2534,17 @@ def GetSchedule():
         for child in children:
             slots_query = text("""
                 SELECT s.slot_id, s.time, ts.day, s.booked, s.Course_id, c.name as course_name,
-                       t.username as teacher_username, t.name as teacher_name,
-                       st.username as student_username, st.name as student_name
-                FROM Slot s
+                       t.username as teacher_username, t.name as teacher_name
+                FROM BookedEnrollmentSlots bes
+                JOIN Enrollment e ON bes.enrollment_id = e.id
+                JOIN Slot s ON bes.slot_id = s.slot_id
                 JOIN TeacherSchedule ts ON s.sch_id = ts.id
                 LEFT JOIN Course c ON s.Course_id = c.id
                 JOIN Teacher t ON ts.teacher_id = t.id
-                LEFT JOIN Enrollment e ON e.qari_id = t.id AND e.course_id = s.Course_id
-                LEFT JOIN Student st ON e.student_id = st.id
-                WHERE s.booked = 1
+                WHERE e.student_id = :child_id
                 ORDER BY ts.day, s.time
             """)
-            slots = db.session.execute(slots_query).fetchall()
+            slots = db.session.execute(slots_query, {"child_id": child.id}).fetchall()
             slot_list = []
             for slot in slots:
                 slot_info = {
@@ -2550,11 +2558,6 @@ def GetSchedule():
                         "name": slot.teacher_name
                     }
                 }
-                if slot.booked and slot.student_username:
-                    slot_info["student"] = {
-                        "username": slot.student_username,
-                        "name": slot.student_name
-                    }
                 slot_list.append(slot_info)
             children_schedules.append({
                 'childId': child.id,
@@ -3010,6 +3013,34 @@ def GetParentChildren():
             for course in courses
         ]
 
+        # Fetch booked slots for this child
+        slots = db.session.execute(text("""
+            SELECT s.slot_id, s.time, ts.day, s.booked, s.sch_id, s.Course_id, c.name as course_name, 
+                   t.username as teacher_username, t.name as teacher_name
+            FROM BookedEnrollmentSlots bes
+            JOIN Enrollment e ON bes.enrollment_id = e.id
+            JOIN Slot s ON bes.slot_id = s.slot_id
+            JOIN TeacherSchedule ts ON s.sch_id = ts.id
+            LEFT JOIN Course c ON s.Course_id = c.id
+            JOIN Teacher t ON ts.teacher_id = t.id
+            WHERE e.student_id = :student_id
+            ORDER BY ts.day, s.time
+        """), {"student_id": child.id}).fetchall()
+        slots_list = [
+            {
+                "slotId": slot.slot_id,
+                "day": slot.day,
+                "time": slot.time,
+                "isBooked": bool(slot.booked),
+                "course": {"courseId": slot.Course_id, "courseName": slot.course_name} if slot.Course_id else None,
+                "teacher": {
+                    "username": slot.teacher_username,
+                    "name": slot.teacher_name
+                }
+            }
+            for slot in slots
+        ]
+
         children_list.append({
             "id": child.id,
             "name": child.name,
@@ -3018,7 +3049,8 @@ def GetParentChildren():
             "age": age,
             "gender": child.gender,
             "region": child.region,
-            "courses": courses_list
+            "courses": courses_list,
+            "slots": slots_list  # <-- Add slots here!
         })
 
     return jsonify({"children": children_list}), 200
@@ -3148,7 +3180,52 @@ def end_video_call():
         WHERE SessionID = :session_id
     '''), {'call_end_time': now, 'session_id': session_id})
     db.session.commit()
-    return jsonify({'success': True})
+    # Return info for rating prompt
+    return jsonify({
+        'success': True,
+        'askForRating': True,
+        'sessionId': session.SessionID,
+        'teacherId': session.TeacherID,
+        'studentId': session.StudentID
+    })
+
+# --- Teacher Rating Endpoint ---
+@app.route('/api/teacher-rating', methods=['POST'])
+def submit_teacher_rating():
+    data = request.json
+    session_id = data.get('sessionId')
+    teacher_id = data.get('teacherId')
+    student_id = data.get('studentId')
+    rating_value = data.get('ratingValue')
+    if not all([session_id, teacher_id, student_id, rating_value]):
+        return jsonify({'error': 'sessionId, teacherId, studentId, and ratingValue are required'}), 400
+    try:
+        db.session.execute(text('''
+            INSERT INTO TeacherRating (SessionID, TeacherID, StudentID, RatingValue, RatedAt)
+            VALUES (:session_id, :teacher_id, :student_id, :rating_value, :rated_at)
+        '''), {
+            'session_id': session_id,
+            'teacher_id': teacher_id,
+            'student_id': student_id,
+            'rating_value': rating_value,
+            'rated_at': datetime.utcnow()
+        })
+        # Calculate new average rating for the teacher
+        avg_rating = db.session.execute(
+            text("SELECT AVG(CAST(RatingValue AS FLOAT)) FROM TeacherRating WHERE TeacherID = :teacher_id"),
+            {'teacher_id': teacher_id}
+        ).scalar()
+        # Update Teacher.ratings column (rounded to 1 decimal place)
+        rounded_avg = round(avg_rating, 1) if avg_rating is not None else None
+        db.session.execute(
+            text("UPDATE Teacher SET ratings = :avg_rating WHERE id = :teacher_id"),
+            {'avg_rating': rounded_avg, 'teacher_id': teacher_id}
+        )
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Rating submitted successfully.'}), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': 'Failed to submit rating', 'details': str(e)}), 500
 
 # Utility function to store all booked slots in VideoCallSession
 @app.route('/storing-classes', methods=['POST'])
