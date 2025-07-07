@@ -27,7 +27,7 @@ CORS(app)
 
 # Configure the SQL Server database connection
 app.config["SQLALCHEMY_DATABASE_URI"] = (
-    "mssql+pyodbc://sa:123@DESKTOP-1TTIBM1\\MRAFE01/QURAN_TUTOR_DB?driver=ODBC+Driver+17+for+SQL+Server&multiple_active_result_sets=true"
+    "mssql+pyodbc://sa:123@DESKTOP-51B7KMU/QURAN_TUTOR_DB?driver=ODBC+Driver+17+for+SQL+Server&multiple_active_result_sets=true"
 )
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
